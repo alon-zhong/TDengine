@@ -447,7 +447,7 @@ void tgInitHandle(HttpServer *pServer) {
 }
 
 bool tgGetUserFromUrl(HttpContext *pContext) {
-  HttpParser *pParser = &pContext->pThread->parser;
+  HttpParser *pParser = &pContext->parser;
   if (pParser->path[TG_USER_URL_POS].len > TSDB_USER_LEN - 1 || pParser->path[TG_USER_URL_POS].len <= 0) {
     return false;
   }
@@ -457,7 +457,7 @@ bool tgGetUserFromUrl(HttpContext *pContext) {
 }
 
 bool tgGetPassFromUrl(HttpContext *pContext) {
-  HttpParser *pParser = &pContext->pThread->parser;
+  HttpParser *pParser = &pContext->parser;
   if (pParser->path[TG_PASS_URL_POS].len > TSDB_PASSWORD_LEN - 1 || pParser->path[TG_PASS_URL_POS].len <= 0) {
     return false;
   }
@@ -467,7 +467,7 @@ bool tgGetPassFromUrl(HttpContext *pContext) {
 }
 
 char *tgGetDbFromUrl(HttpContext *pContext) {
-  HttpParser *pParser = &pContext->pThread->parser;
+  HttpParser *pParser = &pContext->parser;
   if (pParser->path[TG_DB_URL_POS].len <= 0) {
     httpSendErrorResp(pContext, HTTP_TG_DB_NOT_INPUT);
     return NULL;
@@ -700,8 +700,11 @@ bool tgProcessSingleMetricUseDefaultSchema(HttpContext *pContext, cJSON *metric,
   // stable name
   char *stname = name->valuestring;
   table_cmd->metric = stable_cmd->metric = httpAddToSqlCmdBuffer(pContext, "%s", stname);
-  table_cmd->stable = stable_cmd->stable = httpAddToSqlCmdBuffer(pContext, "%s", stname);
-      //httpAddToSqlCmdBuffer(pContext, "%s_%d_%d", stname, fieldsSize, orderTagsLen);
+  if (tsTelegrafUseFieldNum == 0) {
+    table_cmd->stable = stable_cmd->stable = httpAddToSqlCmdBuffer(pContext, "%s", stname);
+  } else {
+    table_cmd->stable = stable_cmd->stable = httpAddToSqlCmdBuffer(pContext, "%s_%d_%d", stname, fieldsSize, orderTagsLen);
+  }
   table_cmd->stable = stable_cmd->stable =
       httpShrinkTableName(pContext, table_cmd->stable, httpGetCmdsString(pContext, table_cmd->stable));
 
@@ -723,9 +726,11 @@ bool tgProcessSingleMetricUseDefaultSchema(HttpContext *pContext, cJSON *metric,
   }
 
   // table name
-  table_cmd->table = stable_cmd->table = httpAddToSqlCmdBufferNoTerminal(pContext, "%s_%s", stname, host->valuestring);
-      //httpAddToSqlCmdBufferNoTerminal(pContext, "%s_%d_%d_%s", stname, fieldsSize, orderTagsLen, host->valuestring);
-
+  if (tsTelegrafUseFieldNum == 0) {
+    table_cmd->table = stable_cmd->table = httpAddToSqlCmdBufferNoTerminal(pContext, "%s_%s", stname, host->valuestring);
+  } else {
+    table_cmd->table = stable_cmd->table = httpAddToSqlCmdBufferNoTerminal(pContext, "%s_%d_%d_%s", stname, fieldsSize, orderTagsLen, host->valuestring);
+  }
   for (int i = 0; i < orderTagsLen; ++i) {
     cJSON *tag = orderedTags[i];
     if (tag == host) continue;
@@ -1158,7 +1163,7 @@ bool tgProcessSingleMetricUseConfigSchema(HttpContext *pContext, cJSON *metric, 
 bool tgProcessQueryRequest(HttpContext *pContext, char *db) {
   httpTrace("context:%p, fd:%d, ip:%s, process telegraf query msg", pContext, pContext->fd, pContext->ipstr);
 
-  HttpParser *pParser = &pContext->pThread->parser;
+  HttpParser *pParser = &pContext->parser;
   char *      filter = pParser->data.pos;
   if (filter == NULL) {
     httpSendErrorResp(pContext, HTTP_NO_MSG_INPUT);

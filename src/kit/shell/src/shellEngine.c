@@ -33,9 +33,8 @@
 #include "tutil.h"
 
 /**************** Global variables ****************/
-char VERSION_INFO[] =
-  "Welcome to the TDengine shell, server version:%s  client version:%s\n"
-  "Copyright (c) 2017 by TAOS Data, Inc. All rights reserved.\n\n";
+char CLIENT_VERSION[] = "Welcome to the TDengine shell, client version:%s  ";
+char SERVER_VERSION[] = "server version:%s\nCopyright (c) 2017 by TAOS Data, Inc. All rights reserved.\n\n";
 char PROMPT_HEADER[] = "taos> ";
 char CONTINUE_PROMPT[] = "   -> ";
 int prompt_size = 6;
@@ -46,6 +45,10 @@ History history;
  * FUNCTION: Initialize the shell.
  */
 TAOS *shellInit(struct arguments *args) {
+  printf("\n");
+  printf(CLIENT_VERSION, taos_get_client_info());
+  fflush(stdout);
+
   // set options before initializing
   if (args->timezone != NULL) {
     taos_options(TSDB_OPTION_TIMEZONE, args->timezone);
@@ -100,8 +103,7 @@ TAOS *shellInit(struct arguments *args) {
     exit(EXIT_SUCCESS);
   }
 
-  printf("\n");
-  printf(VERSION_INFO, taos_get_server_info(con), taos_get_client_info());
+  printf(SERVER_VERSION, taos_get_server_info(con));
 
   return con;
 }
@@ -487,7 +489,7 @@ int shellDumpResult(TAOS *con, char *fname, int *error_no) {
               case TSDB_DATA_TYPE_NCHAR:
                 memset(t_str, 0, TSDB_MAX_BYTES_PER_ROW);
                 memcpy(t_str, row[i], fields[i].bytes);
-                fprintf(fp, "%s", t_str);
+                fprintf(fp, "\'%s\'", t_str);
                 break;
               case TSDB_DATA_TYPE_TIMESTAMP:
 #ifdef WINDOWS
@@ -584,7 +586,7 @@ void write_history() {
 }
 
 void taos_error(TAOS *con) {
-  fprintf(stderr, "TSDB error: %s\n", taos_errstr(con));
+  fprintf(stderr, "\nTSDB error: %s\n\n", taos_errstr(con));
 
   /* free local resouce: allocated memory/metric-meta refcnt */
   TAOS_RES *pRes = taos_use_result(con);
@@ -626,6 +628,7 @@ void source_file(TAOS *con, char *fptr) {
   }
 
   while ((read_len = getline(&line, &line_len, f)) != -1) {
+    if (read_len >= MAX_COMMAND_SIZE) continue;
     line[--read_len] = '\0';
 
     if (read_len == 0 || isCommentLine(line)) {  // line starts with #

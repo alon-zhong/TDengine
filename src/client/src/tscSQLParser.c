@@ -143,9 +143,6 @@ int32_t tscToSQLCmd(SSqlObj* pSql, struct SSqlInfo* pInfo) {
     return TSDB_CODE_INVALID_SQL;
   }
 
-  tscCleanSqlCmd(pCmd);
-  tscAllocPayloadWithSize(pCmd, TSDB_DEFAULT_PAYLOAD_SIZE);
-
   // transfer pInfo into select operation
   switch (pInfo->sqlType) {
     case DROP_TABLE:
@@ -785,7 +782,8 @@ int32_t tscToSQLCmd(SSqlObj* pSql, struct SSqlInfo* pInfo) {
       // set sliding value
       SSQLToken* pSliding = &pQuerySql->sliding;
       if (pSliding->n != 0) {
-        if (!tscEmbedded) {
+        // pCmd->count == 1 means sql in stream function
+        if (!tscEmbedded && pCmd->count == 0) {
           const char* msg = "not support sliding in query";
           setErrMsg(pCmd, msg);
           return TSDB_CODE_INVALID_SQL;
@@ -1951,7 +1949,7 @@ int32_t getColumnIndexByName(SSQLToken* pToken, SSchema* pSchema, int32_t numOfC
     return -1;
   }
 
-  char* r = strnchr(pToken->z, '.', pToken->n);
+  char* r = strnchr(pToken->z, '.', pToken->n, false);
   if (r != NULL) {
     r += 1;
 
@@ -3174,7 +3172,7 @@ int32_t getTimeRange(int64_t* stime, int64_t* etime, tSQLExpr* pRight, int32_t o
   bool    parsed = false;
   if (pRight->val.nType == TSDB_DATA_TYPE_BINARY) {
     strdequote(pRight->val.pz);
-    char* seg = strnchr(pRight->val.pz, '-', pRight->val.nLen);
+    char* seg = strnchr(pRight->val.pz, '-', pRight->val.nLen, false);
     if (seg != NULL) {
       if (taosParseTime(pRight->val.pz, &val, pRight->val.nLen, TSDB_TIME_PRECISION_MICRO) == TSDB_CODE_SUCCESS) {
         parsed = true;

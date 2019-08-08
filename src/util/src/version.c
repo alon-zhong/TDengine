@@ -1,4 +1,4 @@
-char version[64] = "1.6.1.2";
-char compatible_version[64] = "1.6.0.0";
-char gitinfo[128] = "ddcb2519e895c2e2101089aedaf529cee5cefe04";
-char buildinfo[512] = "Built by plum at 2019-07-29 10:41";
+char version[64] = "1.6.1.5";
+char compatible_version[64] = "1.6.1.0";
+char gitinfo[128] = "a99770cd8aefc1b75f5721905b63460f8fa4fdd6";
+char buildinfo[512] = "Built by ubuntu at 2019-08-08 10:23";

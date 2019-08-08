@@ -464,7 +464,7 @@ int taosDumpOut(struct arguments *arguments) {
   TAOS_FIELD *fields = taos_fetch_fields(result);
 
   while ((row = taos_fetch_row(result)) != NULL) {
-    if (strncasecmp(row[TSDB_SHOW_DB_NAME_INDEX], "sys", fields[TSDB_SHOW_DB_NAME_INDEX].bytes) == 0 &&
+    if (strncasecmp(row[TSDB_SHOW_DB_NAME_INDEX], "monitor", fields[TSDB_SHOW_DB_NAME_INDEX].bytes) == 0 &&
         (!arguments->allow_sys))
       continue;
 

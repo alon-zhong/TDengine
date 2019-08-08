@@ -40,7 +40,7 @@ uint32_t tsServerIp;
 
 int (*tscBuildMsg[TSDB_SQL_MAX])(SSqlObj *pSql);
 int (*tscProcessMsgRsp[TSDB_SQL_MAX])(SSqlObj *pSql);
-void (*tscUpdateVnodeMsg[TSDB_SQL_MAX])(SSqlObj *pSql);
+void (*tscUpdateVnodeMsg[TSDB_SQL_MAX])(SSqlObj *pSql, char* buf);
 void tscProcessActivityTimer(void *handle, void *tmrId);
 int tscKeepConn[TSDB_SQL_MAX] = {0};
 
@@ -206,10 +206,24 @@ int tscSendMsgToServer(SSqlObj *pSql) {
   }
 
   if (pSql->thandle) {
+    /*
+     * the total length of message
+     * rpc header + actual message body + digest
+     *
+     * the pSql object may be released automatically during insert procedure, in which the access of
+     * message body by using "if (pHeader->msgType & 1)" may cause the segment fault.
+     *
+     */
+    int32_t totalMsgLen = pSql->cmd.payloadLen + tsRpcHeadSize + sizeof(STaosDigest);
+
+    // the memory will be released by taosProcessResponse, so no memory leak here
+    char* buf = malloc(totalMsgLen);
+    memcpy(buf, pSql->cmd.payload, totalMsgLen);
+
     tscTrace("%p msg:%s is sent to server", pSql, taosMsg[pSql->cmd.msgType]);
-    char *pStart = taosBuildReqHeader(pSql->thandle, pSql->cmd.msgType, pSql->cmd.payload);
+    char *pStart = taosBuildReqHeader(pSql->thandle, pSql->cmd.msgType, buf);
     if (pStart) {
-      if (tscUpdateVnodeMsg[pSql->cmd.command]) (*tscUpdateVnodeMsg[pSql->cmd.command])(pSql);
+      if (tscUpdateVnodeMsg[pSql->cmd.command]) (*tscUpdateVnodeMsg[pSql->cmd.command])(pSql, buf);
       int ret = taosSendMsgToPeerH(pSql->thandle, pStart, pSql->cmd.payloadLen, pSql);
       if (ret >= 0) code = 0;
       tscTrace("%p send msg ret:%d code:%d sig:%p", pSql, ret, code, pSql->signature);
@@ -287,14 +301,20 @@ void *tscProcessMsgFromServer(char *msg, void *ahandle, void *thandle) {
       pSql->thandle = NULL;
       taosAddConnIntoCache(tscConnCache, thandle, pSql->ip, pSql->vnode, pObj->user);
 
-      if (UTIL_METER_IS_METRIC(pCmd) &&
-          (pMsg->content[0] == TSDB_CODE_INVALID_SESSION_ID || pMsg->content[0] == TSDB_CODE_NOT_ACTIVE_SESSION)) {
+      if (UTIL_METER_IS_METRIC(pCmd) && pMsg->content[0] == TSDB_CODE_NOT_ACTIVE_SESSION) {
         /*
          * for metric query, in case of any meter missing during query, sub-query of metric query will failed,
          * causing metric query failed, and return TSDB_CODE_METRICMETA_EXPIRED code to app
          */
         tscTrace("%p invalid meters id cause metric query failed, code:%d", pSql, pMsg->content[0]);
         code = TSDB_CODE_METRICMETA_EXPIRED;
+      } else if ((pCmd->command == TSDB_SQL_INSERT || pCmd->command == TSDB_SQL_SELECT) &&
+          pMsg->content[0] == TSDB_CODE_INVALID_SESSION_ID) {
+        /*
+         * session id is invalid(e.g., less than 0 or larger than maximum session per
+         * vnode) in submit/query msg, no retry
+         */
+         code = TSDB_CODE_INVALID_QUERY_MSG;
       } else if (pCmd->command == TSDB_SQL_CONNECT) {
         code = TSDB_CODE_NETWORK_UNAVAIL;
       } else if (pCmd->command == TSDB_SQL_HB) {
@@ -358,14 +378,17 @@ void *tscProcessMsgFromServer(char *msg, void *ahandle, void *thandle) {
       pRes->code = TSDB_CODE_SUCCESS;
     }
 
-    tscTrace("%p cmd:%d code:%d rsp len:%d", pSql, pCmd->command, pRes->code, pRes->rspLen);
-
     /*
      * There is not response callback function for submit response.
      * The actual inserted number of points is the first number.
      */
     if (pMsg->msgType == TSDB_MSG_TYPE_SUBMIT_RSP) {
       pRes->numOfRows += *(int32_t *)pRes->pRsp;
+
+      tscTrace("%p cmd:%d code:%d, inserted rows:%d, rsp len:%d", pSql, pCmd->command, pRes->code,
+               *(int32_t *)pRes->pRsp, pRes->rspLen);
+    } else {
+      tscTrace("%p cmd:%d code:%d rsp len:%d", pSql, pCmd->command, pRes->code, pRes->rspLen);
     }
   }
 
@@ -421,7 +444,7 @@ void *tscProcessMsgFromServer(char *msg, void *ahandle, void *thandle) {
   return ahandle;
 }
 
-static SSqlObj* tscCreateSqlObjForSubquery(SSqlObj *pSql, SRetrieveSupport *trsupport, SSqlObj* pOld);
+static SSqlObj* tscCreateSqlObjForSubquery(SSqlObj *pSql, SRetrieveSupport *trsupport, SSqlObj* prevSqlObj);
 static int tscLaunchMetricSubQueries(SSqlObj *pSql);
 
 int tscProcessSql(SSqlObj *pSql) {
@@ -429,12 +452,6 @@ int tscProcessSql(SSqlObj *pSql) {
   SSqlCmd *pCmd = &pSql->cmd;
 
   tscTrace("%p SQL cmd:%d will be processed, name:%s", pSql, pSql->cmd.command, pSql->cmd.name);
-
-  // whether don't judge 'isInsertFromFile' ?
-  if (pSql->cmd.command == TSDB_SQL_INSERT && pCmd->isInsertFromFile == 1) {
-    // pCmd->isInsertFromFile = 0;   // lihui: can not clear the flag
-    return 0;
-  }
 
   pSql->retry = 0;
   if (pSql->cmd.command < TSDB_SQL_MGMT) {
@@ -595,7 +612,6 @@ int tscLaunchMetricSubQueries(SSqlObj *pSql) {
 
     SSqlObj *pNew = tscCreateSqlObjForSubquery(pSql, trs, NULL);
     tscTrace("%p sub:%p launch subquery.orderOfSub:%d", pSql, pNew, pNew->cmd.vnodeIdx);
-
     tscProcessSql(pNew);
   }
 
@@ -665,7 +681,6 @@ static void tscHandleSubRetrievalError(SRetrieveSupport *trsupport, SSqlObj *pSq
     tscError("%p sub:%p abort further retrieval due to other queries failure,orderOfSub:%d,code:%d",
         pPObj, pSql, idx, *trsupport->code);
   } else {
-
     if (trsupport->numOfRetry++ < MAX_NUM_OF_SUBQUERY_RETRY && *(trsupport->code) == TSDB_CODE_SUCCESS) {
       /*
        * current query failed, and the retry count is less than the available count,
@@ -675,11 +690,12 @@ static void tscHandleSubRetrievalError(SRetrieveSupport *trsupport, SSqlObj *pSq
 
       // clear local saved number of results
       trsupport->localBuffer->numOfElems = 0;
+
       pthread_mutex_unlock(&trsupport->queryMutex);
 
       SSqlObj *pNew = tscCreateSqlObjForSubquery(trsupport->pParentSqlObj, trsupport, pSql);
       tscTrace("%p sub:%p retrieve failed, code:%d, orderOfSub:%d, retry:%d, new SqlObj:%p",
-               trsupport->pParentSqlObj, pSql, numOfRows, idx, trsupport->numOfRetry, pNew);
+          trsupport->pParentSqlObj, pSql, numOfRows, idx, trsupport->numOfRetry, pNew);
 
       tscProcessSql(pNew);
       return;
@@ -689,7 +705,6 @@ static void tscHandleSubRetrievalError(SRetrieveSupport *trsupport, SSqlObj *pSq
       tscError("%p sub:%p retrieve failed,code:%d,orderOfSub:%d failed.no more retry,set global code:%d",
                pPObj, pSql, numOfRows, idx, *trsupport->code);
     }
-
   }
 
   if (__sync_add_and_fetch_32(trsupport->numOfFinished, 1) < trsupport->numOfVnodes) {
@@ -778,7 +793,7 @@ void tscRetrieveFromVnodeCallBack(void *param, TAOS_RES *tres, int numOfRows) {
     tscTrace("%p sub:%p all data retrieved from ip:%u,vid:%d, numOfRows:%d, orderOfSub:%d",
              pPObj, pSql, pSvd->ip, pSvd->vnode, numOfRowsFromVnode, idx);
 
-    tColModelCompress(pDesc->pSchema, trsupport->localBuffer, pDesc->pSchema->maxCapacity);
+    tColModelCompact(pDesc->pSchema, trsupport->localBuffer, pDesc->pSchema->maxCapacity);
 
 #ifdef _DEBUG_VIEW
     printf("%ld rows data flushed to disk:\n", trsupport->localBuffer->numOfElems);
@@ -877,7 +892,7 @@ void tscKillMetricQuery(SSqlObj *pSql) {
   tscTrace("%p metric query is cancelled", pSql);
 }
 
-static SSqlObj* tscCreateSqlObjForSubquery(SSqlObj *pSql, SRetrieveSupport *trsupport, SSqlObj* prevSqlObj) {
+SSqlObj* tscCreateSqlObjForSubquery(SSqlObj *pSql, SRetrieveSupport *trsupport, SSqlObj* prevSqlObj) {
   SSqlCmd *pCmd = &pSql->cmd;
 
   SSqlObj *pNew = (SSqlObj *)calloc(1, sizeof(SSqlObj));
@@ -1006,12 +1021,12 @@ int tscBuildRetrieveMsg(SSqlObj *pSql) {
   return msgLen;
 }
 
-void tscUpdateVnodeInSubmitMsg(SSqlObj *pSql) {
+void tscUpdateVnodeInSubmitMsg(SSqlObj *pSql, char* buf) {
   SShellSubmitMsg *pShellMsg;
   char *           pMsg;
   SMeterMeta *     pMeterMeta = pSql->cmd.pMeterMeta;
 
-  pMsg = pSql->cmd.payload + tsRpcHeadSize;
+  pMsg = buf + tsRpcHeadSize;
 
   pShellMsg = (SShellSubmitMsg *)pMsg;
   pShellMsg->vnode = htons(pMeterMeta->vpeerDesc[pSql->index].vnode);
@@ -1032,8 +1047,6 @@ int tscBuildSubmitMsg(SSqlObj *pSql) {
   pShellMsg->vnode = htons(pMeterMeta->vpeerDesc[pMeterMeta->index].vnode);
   pShellMsg->numOfSid = htonl(pSql->cmd.count); /* number of meters to be inserted */
 
-  pMsg += sizeof(SShellSubmitMsg);
-
   /*
    * pSql->cmd.payloadLen is set during parse sql routine, so we do not use it here
    */
@@ -1043,9 +1056,9 @@ int tscBuildSubmitMsg(SSqlObj *pSql) {
   return msgLen;
 }
 
-void tscUpdateVnodeInQueryMsg(SSqlObj *pSql) {
+void tscUpdateVnodeInQueryMsg(SSqlObj *pSql, char* buf) {
   SSqlCmd *pCmd = &pSql->cmd;
-  char *   pStart = pCmd->payload + tsRpcHeadSize;
+  char *   pStart = buf + tsRpcHeadSize;
 
   SQueryMeterMsg *pQueryMsg = (SQueryMeterMsg *)pStart;
 
@@ -2264,8 +2277,6 @@ int tscBuildMetricMetaMsg(SSqlObj *pSql) {
 
   SSqlGroupbyExpr *pGroupby = &pCmd->groupbyExpr;
 
-  pMetaMsg->limit = htobe64(pCmd->glimit.limit);
-  pMetaMsg->offset = htobe64(pCmd->glimit.offset);
   pMetaMsg->numOfTags = htons(pCmd->numOfReqTags);
   pMetaMsg->numOfGroupbyCols = htons(pGroupby->numOfGroupbyCols);
 
@@ -2750,7 +2761,6 @@ static int32_t tscDoGetMeterMeta(SSqlObj *pSql, char *meterId) {
   } else {
     pNew->fp = tscMeterMetaCallBack;
     pNew->param = pSql;
-
     pNew->sqlstr = strdup(pSql->sqlstr);
 
     code = tscProcessSql(pNew);
@@ -2797,8 +2807,7 @@ int tscGetMeterMetaEx(SSqlObj *pSql, char *meterId, bool createIfNotExists) {
  * successfully created the corresponding table.
  */
 static void tscWaitingForCreateTable(SSqlCmd *pCmd) {
-  int32_t CREATE_METER_ON_DEMAND = 1;
-  if (pCmd->command == TSDB_SQL_INSERT && pCmd->defaultVal[0] == CREATE_METER_ON_DEMAND) {
+  if (pCmd->command == TSDB_SQL_INSERT) {
     taosMsleep(50);  // todo: global config
   }
 }
